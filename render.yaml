@@ -1,0 +1,24 @@
+# Render Blueprint for PulseWatch.
+#
+# The Next.js app (UI + API routes + server actions) is deployed on Vercel.
+# Render provides the scheduler only: a cron job that POSTs to the secured
+# /api/cron/run-checks endpoint once a minute.
+#
+# Note: Render cron jobs have no free plan — the minimum charge is $1/month.
+# A free alternative is an external scheduler such as cron-job.org.
+services:
+  - type: cron
+    name: pulsewatch-cron
+    runtime: docker
+    dockerfilePath: ./ops/cron/Dockerfile
+    dockerContext: ./ops/cron
+    # Every minute, UTC (Render cron expressions always use UTC).
+    schedule: "* * * * *"
+    envVars:
+      # Set both in the Render dashboard. TARGET_URL is the deployed Vercel app
+      # origin, e.g. https://pulsewatch.vercel.app (no trailing slash).
+      - key: TARGET_URL
+        sync: false
+      # Must be byte-for-byte identical to the CRON_SECRET set on Vercel.
+      - key: CRON_SECRET
+        sync: false
