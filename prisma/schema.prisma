@@ -1,0 +1,289 @@
+// PulseWatch database schema
+// Docs: https://pris.ly/d/prisma-schema
+//
+// Conventions:
+// - All timestamps are stored in UTC (Postgres `timestamptz`).
+// - Primary keys are CUIDs so IDs are sortable-ish and non-enumerable.
+// - Auth tables follow the Auth.js (NextAuth v5) Prisma adapter contract.
+//   Model names (User/Account/Session/VerificationToken) must not be renamed
+//   without also configuring the adapter; `@@map` only changes the SQL table name.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum MonitorType {
+  WEBSITE
+  API
+}
+
+enum HttpMethod {
+  GET
+  HEAD
+  POST
+}
+
+enum MonitorStatus {
+  UNKNOWN
+  UP
+  DOWN
+}
+
+/// Why a check failed. Kept as an enum (not free text) so analytics and the
+/// UI can group failures by cause without parsing strings.
+enum CheckErrorType {
+  TIMEOUT
+  DNS_FAILURE
+  TLS_ERROR
+  UNEXPECTED_STATUS
+  CONNECTION_ERROR
+  SSRF_BLOCKED
+  TOO_MANY_REDIRECTS
+  RESPONSE_TOO_LARGE
+  INVALID_URL
+  UNKNOWN
+}
+
+enum IncidentStatus {
+  INVESTIGATING
+  IDENTIFIED
+  MONITORING
+  RESOLVED
+}
+
+// ---------------------------------------------------------------------------
+// Auth.js (NextAuth v5) tables
+// ---------------------------------------------------------------------------
+
+model User {
+  id             String    @id @default(cuid())
+  name           String?
+  email          String    @unique
+  emailVerified  DateTime?
+  image          String?
+  /// Only set for email/password accounts; null for OAuth-only users.
+  hashedPassword String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  accounts        Account[]
+  sessions        Session[]
+  projects        Project[]
+  incidentUpdates IncidentUpdate[]
+
+  @@map("users")
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  sessionToken String   @id
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Domain
+// ---------------------------------------------------------------------------
+
+model Project {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  monitors   Monitor[]
+  statusPage StatusPage?
+
+  @@index([userId])
+  @@map("projects")
+}
+
+model Monitor {
+  id          String @id @default(cuid())
+  projectId   String
+  name        String
+  url         String
+  description String?
+
+  type                 MonitorType @default(WEBSITE)
+  method               HttpMethod  @default(GET)
+  /// Allowed response status codes (e.g. [200, 201]). Range checks are done
+  /// in the check engine, not in SQL.
+  expectedStatusCodes  Int[]       @default([200])
+  timeoutMs            Int         @default(10000)
+  /// One of 1, 5, 10, 30, 60 — validated in the app layer with Zod.
+  intervalMinutes      Int         @default(5)
+  enabled              Boolean     @default(true)
+
+  /// Flap protection: how many consecutive failures open an incident, and how
+  /// many consecutive successes resolve it.
+  failureThreshold  Int @default(2)
+  recoveryThreshold Int @default(1)
+
+  /// Denormalised state machine fields, updated by the check engine.
+  status               MonitorStatus @default(UNKNOWN)
+  consecutiveFailures  Int           @default(0)
+  consecutiveSuccesses Int           @default(0)
+
+  lastCheckedAt DateTime?
+  /// When the scheduler is allowed to check this monitor again.
+  nextCheckAt   DateTime?
+  /// Lease lock: a cron run claims a monitor until this instant so two
+  /// concurrent invocations cannot check the same monitor.
+  lockedUntil   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project   Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  checks    CheckResult[]
+  incidents Incident[]
+  rollups   DailyRollup[]
+
+  @@index([projectId])
+  /// Drives the "which monitors are due?" query.
+  @@index([enabled, nextCheckAt])
+  @@index([projectId, createdAt])
+  @@map("monitors")
+}
+
+model CheckResult {
+  id             String  @id @default(cuid())
+  monitorId      String
+  success        Boolean
+  statusCode     Int?
+  responseTimeMs Int?
+  errorType      CheckErrorType?
+  errorMessage   String?
+  /// When the check actually ran (UTC). Indexed with monitorId desc because
+  /// every "last N checks" query sorts this way.
+  checkedAt      DateTime @default(now())
+
+  monitor Monitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+
+  @@index([monitorId, checkedAt(sort: Desc)])
+  @@index([monitorId, success])
+  @@index([checkedAt])
+  @@map("check_results")
+}
+
+model Incident {
+  id          String         @id @default(cuid())
+  monitorId   String
+  status      IncidentStatus @default(INVESTIGATING)
+  title       String
+  description String?
+  startedAt   DateTime       @default(now())
+  resolvedAt  DateTime?
+  /// Derived (resolvedAt - startedAt) but stored so analytics never has to
+  /// recompute it and it stays correct if timestamps are edited.
+  durationMs  Int?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  monitor Monitor          @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  updates IncidentUpdate[]
+
+  @@index([monitorId, startedAt(sort: Desc)])
+  @@index([status, startedAt(sort: Desc)])
+  @@map("incidents")
+}
+
+model IncidentUpdate {
+  id         String          @id @default(cuid())
+  incidentId String
+  message    String
+  /// Set when this update also moved the incident status.
+  status     IncidentStatus?
+  /// Null for system-generated updates (auto open / auto resolve).
+  authorId   String?
+  createdAt  DateTime        @default(now())
+
+  incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  author   User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  @@index([incidentId, createdAt])
+  @@map("incident_updates")
+}
+
+model StatusPage {
+  id          String   @id @default(cuid())
+  /// 1:1 with Project — a project has at most one public status page.
+  projectId   String   @unique
+  slug        String   @unique
+  title       String
+  description String?
+  isPublic    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("status_pages")
+}
+
+/// Daily aggregate per monitor. Powers long-range (30/90 day) charts without
+/// scanning raw checks, and makes the retention job a simple delete.
+model DailyRollup {
+  id        String   @id @default(cuid())
+  monitorId String
+  /// UTC day bucket, always midnight UTC.
+  date      DateTime
+
+  totalChecks       Int @default(0)
+  successChecks     Int @default(0)
+  failChecks        Int @default(0)
+  sumResponseTimeMs Int @default(0)
+  minResponseTimeMs Int?
+  maxResponseTimeMs Int?
+  downtimeMs        Int @default(0)
+
+  monitor Monitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+
+  @@unique([monitorId, date])
+  @@map("daily_rollups")
+}
